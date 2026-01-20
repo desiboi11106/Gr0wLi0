@@ -1,151 +1,212 @@
 import streamlit as st
+st.write("Theme loaded:", st.config.get_option("theme.primaryColor"))
+
+import yfinance as yf
 import pandas as pd
-import math
-from pathlib import Path
+import datetime
+import plotly.graph_objects as go
+import os
+import time
+from openai import OpenAI
+import gspread
+from google.oauth2.service_account import Credentials
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
+import seaborn as sns
+import sqlite3
+from datetime import datetime as dt, timedelta, date
+import io
+import feedparser
+import requests
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# --------------------
+# 🔔 TELEGRAM ALERT CONFIG
+# --------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+def send_telegram_alert(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    requests.post(url, json=payload)
 
+def already_alerted_today(ticker):
+    conn = sqlite3.connect("alerts.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            ticker TEXT,
+            alert_date TEXT
+        )
+    """)
+    today = date.today().isoformat()
+    c.execute(
+        "SELECT 1 FROM alerts WHERE ticker=? AND alert_date=?",
+        (ticker, today)
+    )
+    exists = c.fetchone() is not None
+    conn.close()
+    return exists
+
+def mark_alerted_today(ticker):
+    conn = sqlite3.connect("alerts.db")
+    c = conn.cursor()
+    today = date.today().isoformat()
+    c.execute(
+        "INSERT INTO alerts VALUES (?, ?)",
+        (ticker, today)
+    )
+    conn.commit()
+    conn.close()
+
+# --------------------
+# App Setup
+# --------------------
+st.set_page_config(page_title="Growlio 📈", layout="wide")
+
+# --------------------
+# Shared: API Keys + clients
+# --------------------
+openai_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+st.sidebar.write("🔑 OpenAI key loaded:", "✅ Yes" if openai_key else "❌ No")
+
+client = OpenAI(api_key=openai_key) if openai_key else None
+
+has_gcp = "gcp_service_account" in st.secrets
+st.sidebar.write("🔒 Google Sheets loaded:", "✅" if has_gcp else "❌")
+
+# --------------------
+# Shared helpers
+# --------------------
 @st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+def load_data(tickers, start, end):
+    data = yf.download(tickers, start=start, end=end, group_by="ticker", auto_adjust=True)
+    return data
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+def fetch_news_auto(ticker):
+    query = f"{ticker}+stock"
+    rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    feed = feedparser.parse(rss_url)
+    return [{
+        "title": e.title,
+        "url": e.link,
+        "date": e.published if "published" in e else "Unknown"
+    } for e in feed.entries[:8]]
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+def update_google_sheet_with_news(sheet_key, tickers):
+    if not has_gcp:
+        return
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    gc = gspread.authorize(creds)
+    ws = gc.open_by_key(sheet_key).sheet1
+    rows = []
+    for t in tickers:
+        for n in fetch_news_auto(t):
+            rows.append([t, n["title"], n["url"], n["date"]])
+    if rows:
+        ws.clear()
+        ws.update([["ticker", "title", "url", "date"]] + rows)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+def openai_summary_from_headlines(ticker, headlines):
+    if not client:
+        return "OpenAI key missing."
+    combined = " | ".join(headlines[:12])
+    prompt = f"Explain why {ticker} moved today based on: {combined}"
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return res.choices[0].message.content.strip()
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+# --------------------
+# Growlio Page (UNCHANGED UI + ALERTS ADDED)
+# --------------------
+def growlio_page():
+    st.title("📊 Growlio - Investment Learning App")
+
+    st.sidebar.header("Stock Settings (Growlio)")
+    tickers_input = st.sidebar.text_input("Enter Stock Tickers (comma separated)", "AAPL, MSFT, TSLA")
+    start = st.sidebar.date_input("Start Date", datetime.date(2023, 1, 1))
+    end = st.sidebar.date_input("End Date", datetime.date.today())
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+
+    data = load_data(tickers, start, end)
+
+    st.subheader("📈 Stock Metrics")
+    cols = st.columns(len(tickers))
+    for i, ticker in enumerate(tickers):
+        last_close = data[ticker]["Close"].iloc[-1]
+        first_close = data[ticker]["Close"].iloc[0]
+        change = ((last_close - first_close) / first_close) * 100
+        cols[i].metric(ticker, f"${last_close:.2f}", f"{change:.2f}%")
+
+    st.subheader("📉 Stock Price Comparison")
+    fig = go.Figure()
+    for ticker in tickers:
+        fig.add_trace(go.Scatter(x=data[ticker].index, y=data[ticker]["Close"], mode="lines", name=ticker))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("🔗 Google Sheet Settings")
+    sheet_key = st.text_input(
+        "Google Sheet ID (Sheet key)",
+        value="10zj6tfkdwxNH9lPDeAx5QdM-vcx3G_FsICpC6Us8dx8"
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+    if st.button("🔄 Refresh News for All Tickers"):
+        update_google_sheet_with_news(sheet_key, tickers)
 
-    return gdp_df
+    st.subheader("🔍 Detailed Analysis per Stock")
+    for ticker in tickers:
+        st.markdown(f"## {ticker}")
+        df = data[ticker].copy()
 
-gdp_df = get_gdp_data()
+        df["50MA"] = df["Close"].rolling(50).mean()
+        df["200MA"] = df["Close"].rolling(200).mean()
+        df["Signal"] = (
+            (df["50MA"] > df["200MA"]) &
+            (df["50MA"].shift(1) <= df["200MA"].shift(1))
+        )
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+        buy_signals = df[df["Signal"]]
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+        # 🔔 ALERT LOGIC (NON-INTRUSIVE)
+        if not buy_signals.empty:
+            last_signal_date = buy_signals.index[-1].date()
+            if last_signal_date == date.today():
+                if not already_alerted_today(ticker):
+                    price = df.loc[buy_signals.index[-1], "Close"]
+                    send_telegram_alert(
+                        f"🚀 BUY SIGNAL\nTicker: {ticker}\nPrice: ${price:.2f}\nStrategy: Golden Cross"
+                    )
+                    mark_alerted_today(ticker)
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+        fig2 = go.Figure()
+        fig2.add_trace(go.Candlestick(
+            x=df.index, open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"]
+        ))
+        fig2.add_trace(go.Scatter(x=df.index, y=df["50MA"], name="50MA"))
+        fig2.add_trace(go.Scatter(x=df.index, y=df["200MA"], name="200MA"))
+        fig2.add_trace(go.Scatter(
+            x=buy_signals.index, y=buy_signals["Close"],
+            mode="markers", marker=dict(symbol="triangle-up", color="green", size=10)
+        ))
+        st.plotly_chart(fig2, use_container_width=True)
 
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+# --------------------
+# Navigation (UNCHANGED)
+# --------------------
+st.sidebar.title("Growlio Super-App")
+page = st.sidebar.radio(
+    "Select page",
+    ["Growlio (default)", "Portfolio Risk Dashboard", "TradeFlow Analyzer"]
 )
 
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+if page == "Growlio (default)":
+    growlio_page()
